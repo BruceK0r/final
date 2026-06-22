@@ -75,6 +75,10 @@ class Control:
 
         self.lane_width = 4.0
         self.conflict_width = self.lane_width * 1.25
+        self.same_lane_conflict_half_width = self.lane_width * 0.45
+        self.adjacent_lane_min_offset = self.same_lane_conflict_half_width
+        self.adjacent_lane_max_offset = self.lane_width * 1.5
+        self.adjacent_oncoming_heading_threshold = math.radians(150.0)
         self.min_gap = 5.0
         self.time_headway = 1.5
         self.ttc_threshold = 2.5
@@ -302,6 +306,7 @@ class Control:
             x_rel, y_rel = self.transform_to_ego_frame(x, y)
             distance = math.hypot(x_rel, y_rel)
             heading_diff = abs(self.normalize_angle(yaw - self.m_yaw))
+            route_lateral_offset = self.get_route_lateral_offset(x, y)
             vehicle = {
                 "name": name,
                 "x": x,
@@ -312,6 +317,7 @@ class Control:
                 "y_rel": y_rel,
                 "distance": distance,
                 "heading_diff": heading_diff,
+                "route_lateral_offset": route_lateral_offset,
                 "raw": raw_vehicle,
                 "classification": "IRRELEVANT",
                 "ttc": float("inf"),
@@ -338,6 +344,71 @@ class Control:
         x_rel = math.cos(self.m_yaw) * dx + math.sin(self.m_yaw) * dy
         y_rel = -math.sin(self.m_yaw) * dx + math.cos(self.m_yaw) * dy
         return x_rel, y_rel
+
+    def get_route_lateral_offset(self, x, y):
+        point_count = self.get_effective_path_point_count()
+        if point_count < 2:
+            return None
+
+        search_count = min(point_count, 120)
+        if self.is_closed_path:
+            segment_indices = [
+                self.normalize_path_index(self.vehpos_initial_index - 20 + step)
+                for step in range(search_count)
+            ]
+        else:
+            start_index = max(0, self.normalize_path_index(self.vehpos_initial_index) - 20)
+            end_index = min(point_count - 1, start_index + search_count)
+            segment_indices = range(start_index, end_index)
+
+        best_distance_sq = float("inf")
+        best_lateral_offset = None
+
+        for segment_start in segment_indices:
+            segment_end = self.normalize_path_index(segment_start + 1)
+            if not self.is_closed_path and segment_end <= segment_start:
+                continue
+
+            ax = self.X_points[segment_start]
+            ay = self.Y_points[segment_start]
+            bx = self.X_points[segment_end]
+            by = self.Y_points[segment_end]
+            dx = bx - ax
+            dy = by - ay
+            length_sq = dx * dx + dy * dy
+            if length_sq <= 1e-12:
+                continue
+
+            ratio = self.clamp(((x - ax) * dx + (y - ay) * dy) / length_sq, 0.0, 1.0)
+            closest_x = ax + ratio * dx
+            closest_y = ay + ratio * dy
+            distance_sq = (x - closest_x) ** 2 + (y - closest_y) ** 2
+            if distance_sq < best_distance_sq:
+                best_distance_sq = distance_sq
+                segment_yaw = math.atan2(dy, dx)
+                best_lateral_offset = (
+                    -math.sin(segment_yaw) * (x - closest_x)
+                    + math.cos(segment_yaw) * (y - closest_y)
+                )
+
+        return best_lateral_offset
+
+    def get_vehicle_lane_lateral_offset(self, other_vehicle):
+        route_lateral_offset = other_vehicle.get("route_lateral_offset")
+        if route_lateral_offset is not None:
+            return route_lateral_offset
+        return other_vehicle["y_rel"]
+
+    def is_same_lane_vehicle(self, other_vehicle):
+        return abs(self.get_vehicle_lane_lateral_offset(other_vehicle)) <= self.same_lane_conflict_half_width
+
+    def is_left_adjacent_lane_oncoming_vehicle(self, other_vehicle):
+        lateral_offset = self.get_vehicle_lane_lateral_offset(other_vehicle)
+        return (
+            self.adjacent_lane_min_offset < lateral_offset <= self.adjacent_lane_max_offset
+            and other_vehicle["heading_diff"] >= self.adjacent_oncoming_heading_threshold
+            and other_vehicle["distance"] <= self.oncoming_detect_dist
+        )
 
     def is_turn_detection_area(self):
         return self.estimate_path_curvature(self.vehpos_initial_index) >= self.turn_detect_curvature_threshold
@@ -372,6 +443,9 @@ class Control:
         ):
             return "FRONT_SAME_DIRECTION"
 
+        if self.is_left_adjacent_lane_oncoming_vehicle(other_vehicle):
+            return "ADJACENT_LANE_ONCOMING"
+
         if (
             self.is_in_forward_detection_area(
                 other_vehicle,
@@ -379,6 +453,7 @@ class Control:
                 self.conflict_width,
             )
             and heading_diff > math.radians(120.0)
+            and self.is_same_lane_vehicle(other_vehicle)
         ):
             return "ONCOMING_VEHICLE"
 
@@ -405,6 +480,9 @@ class Control:
 
     def has_collision_risk(self, other_vehicle):
         classification = other_vehicle.get("classification", "IRRELEVANT")
+        if classification == "ADJACENT_LANE_ONCOMING":
+            return False
+
         ego_speed = self.get_ego_collision_speed()
 
         if classification == "FRONT_SAME_DIRECTION":
@@ -750,6 +828,9 @@ class Control:
 
     def emergency_stop_if_needed(self, neighbor_vehicles, v_ref=None, w_ref=None):
         for vehicle in neighbor_vehicles:
+            if vehicle.get("classification") == "ADJACENT_LANE_ONCOMING":
+                continue
+
             distance = vehicle.get("distance", float("inf"))
             if distance < self.emergency_distance:
                 self.behavior_state = "EMERGENCY_STOP"
