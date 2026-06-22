@@ -27,13 +27,21 @@ v_cmd, w_cmd = self.multi_vehicle_safety_layer(v_ref, w_ref)
 
 安全层按优先级处理：紧急停车和边界风险最高，其次是车辆碰撞风险；正在执行的变道/绕行轨迹会持续做边界和车辆预测检查；无风险时回到 `NORMAL_PATH_FOLLOW`，继续使用原纯跟踪命令。
 
+## 邻车检测范围
+
+直道检测使用自车坐标系前向窄走廊：前方同向车检测前方 35m、横向半宽 2m；对向车检测前方 45m、横向半宽 5m；后车检测后方 25m、横向半宽 2m；近旁车检测 `|x_rel| < 4m` 且 `|y_rel| < 6m`。当路径曲率大于 `0.035` 时，前方同向车和对向车改用前向扇形检测，半角 65 度，距离上限仍分别为 35m 和 45m，之后再用航向差区分同向和对向。
+
+## 速度和预瞄
+
+当前最高巡航速度为 `cruise_speed = 15.0`。直道上使用更大的动态预瞄距离提升高速稳定性；弯道中通过路径曲率压缩预瞄距离，并继续使用横向加速度限制降低实际输出速度。为减少弯道入口慢半拍和左右摆动，控制器会把前方路径的带符号曲率作为转向前馈，并用路径曲率提前限制弯道速度。
+
 ## 前车跟车和超车
 
 前方同向车通过自车坐标系下的 `x_rel`、`y_rel` 和航向差分类。若间距小于 `min_gap + ego_speed * time_headway` 或 TTC 小于阈值，进入 `FRONT_CAR_FOLLOW`，用安全间距误差调节速度。前车低速或停车持续超过 `blocking_time_threshold` 后，生成左右平滑偏移轨迹，只有车辆预测和边界检查都通过才进入 `TRY_LANE_CHANGE`。
 
-## 对向来车让行和绕行
+## 对向来车让行
 
-对向车风险用双方速度和距离计算 TTC。存在风险时先进入 `ONCOMING_YIELD`，按 `comfort_decel` 平滑减速到 0。停车超过 `stop_wait_time` 后进入 `TRY_BYPASS`，生成左右绕行候选轨迹；若都不安全则继续停车，不强行绕行。
+对向车风险用双方速度和距离计算 TTC。存在风险时进入 `ONCOMING_YIELD`，按 `comfort_decel` 平滑减速到 0 并保持停车等待；风险解除后回到 `NORMAL_PATH_FOLLOW`。已删除停车超过固定时间后进入 `TRY_BYPASS` 的逻辑，不再尝试对向车绕行重规划。
 
 ## 地图边界检查
 
@@ -46,7 +54,7 @@ v_cmd, w_cmd = self.multi_vehicle_safety_layer(v_ref, w_ref)
 - 其他车辆预测使用短时匀速直线模型，复杂机动场景需要更强预测模型。
 - 候选轨迹是基于原路径法向的平滑横向偏移，不做全局规划。
 - 当前仓库没有实际边界 JSON，默认启动时若找不到边界文件则边界约束为空。
-- 可重点调参：`min_gap`、`time_headway`、`ttc_threshold`、`oncoming_ttc_threshold`、`lane_change_offset`、`lane_change_length`、`bypass_length`、`vehicle_safe_radius`、`boundary_safe_margin`。
+- 可重点调参：`min_gap`、`time_headway`、`ttc_threshold`、`oncoming_ttc_threshold`、`lane_change_offset`、`lane_change_length`、`vehicle_safe_radius`、`boundary_safe_margin`。
 
 ## 验证
 

@@ -13,7 +13,7 @@ class Control:
         self.udp_send_port = 9001
         self.server_ip = '192.168.1.100'
 
-        net = "RST6phjHTlYisx4dqWmCnNpkYfTV,127.0.0.1,2076,2077"
+        net = "RST6phjHTlYisx4dqWmCnNpkYfTV,127.0.0.1,4986,4987"
         if net != "":
             net = net.split(",")
             self.vehicle_name = net[0]
@@ -40,17 +40,22 @@ class Control:
         self.is_closed_path = False
         self.control_rate = 15  # hz
         self.wheel_base = 2.7
+        self.cruise_speed = 15.0
         self.min_lookahead = 5.0
-        self.max_lookahead = 16.0
-        self.base_lookahead = 4.0
-        self.speed_lookahead_gain = 0.45
-        self.curvature_lookahead_gain = 12.0
+        self.max_lookahead = 22.0
+        self.base_lookahead = 5.5
+        self.speed_lookahead_gain = 0.6
+        self.curvature_lookahead_gain = 16.0
         self.lookahead_distance = self.min_lookahead
         self.max_steer = math.radians(30.0)
-        self.max_steer_rate = math.radians(120.0)
+        self.max_steer_rate = math.radians(180.0)
         self.last_steering_angle = 0.0
         self.min_speed = 4.0
-        self.max_lat_acc = 2.5
+        self.max_lat_acc = 3.0
+        self.turn_feedforward_gain = 0.5
+        self.turn_feedforward_start_curvature = 0.025
+        self.turn_feedforward_full_curvature = 0.12
+        self.turn_speed_curvature_gain = 0.8
         self.last_v_cmd = 0.0
         self.last_w_cmd = 0.0
         self.current_v_ref = 0.0
@@ -59,7 +64,6 @@ class Control:
 
         # Multi-vehicle safety layer parameters.
         self.behavior_state = "NORMAL_PATH_FOLLOW"
-        self.stop_start_time = None
         self.front_block_start_time = None
         self.current_bypass_path = []
         self.current_bypass_index = 0
@@ -74,17 +78,19 @@ class Control:
         self.min_gap = 5.0
         self.time_headway = 1.5
         self.ttc_threshold = 2.5
-        self.front_detect_dist = 25.0
+        self.front_detect_dist = 35.0
+        self.rear_detect_dist = 25.0
         self.oncoming_ttc_threshold = 3.0
-        self.oncoming_detect_dist = 35.0
+        self.oncoming_detect_dist = 45.0
+        self.turn_detect_curvature_threshold = 0.035
+        self.turn_detect_half_angle = math.radians(65.0)
+        self.straight_detect_half_width = self.lane_width / 2.0
         self.k_gap = 0.4
         self.low_speed_threshold = 2.0
         self.blocking_time_threshold = 2.0
         self.comfort_decel = 2.0
-        self.stop_wait_time = 3.0
         self.lane_change_offset = 4.0
         self.lane_change_length = 25.0
-        self.bypass_length = 35.0
         self.vehicle_safe_radius = 4.0
         self.prediction_horizon = 3.0
         self.prediction_dt = 0.3
@@ -110,7 +116,7 @@ class Control:
 
     def control_node(self):
         start_time = time.time()
-        self.load_route('exp_routes/ccw_right_bottom_loop_closed.json')
+        self.load_route('exp_routes/ccw_right_bottom_loop_adjusted.json')
         self.try_load_default_map_boundaries()
         while True:
             self.run_step()
@@ -127,7 +133,7 @@ class Control:
         self.m_y = vehicle_data.y
         self.m_yaw = vehicle_data.yaw / 180 * math.pi
         self.ego_speed = self.get_vehicle_speed(vehicle_data, self.last_v_cmd)
-        self.m_v = 10
+        self.m_v = self.cruise_speed
         self.update_vehpos_index()
         self.search_target_pos()
 
@@ -195,13 +201,18 @@ class Control:
 
         lookahead_dist = max(target_distance, 1e-3)
         curvature = 2.0 * math.sin(alpha) / lookahead_dist
+        path_curvature = self.estimate_signed_path_curvature(self.vehpos_initial_index)
+        turn_strength = self.calc_turn_strength(path_curvature)
+        curvature += self.turn_feedforward_gain * turn_strength * path_curvature
+
         steering_angle = math.atan(self.wheel_base * curvature)
         steering_angle = self.clamp(steering_angle, -self.max_steer, self.max_steer)
         steering_angle = self.limit_steering_angle(steering_angle)
 
         actual_curvature = abs(math.tan(steering_angle) / self.wheel_base)
-        if actual_curvature > 1e-6:
-            v_limit = math.sqrt(self.max_lat_acc / actual_curvature)
+        speed_limit_curvature = max(actual_curvature, self.turn_speed_curvature_gain * abs(path_curvature))
+        if speed_limit_curvature > 1e-6:
+            v_limit = math.sqrt(self.max_lat_acc / speed_limit_curvature)
         else:
             v_limit = self.m_v
 
@@ -328,6 +339,23 @@ class Control:
         y_rel = -math.sin(self.m_yaw) * dx + math.cos(self.m_yaw) * dy
         return x_rel, y_rel
 
+    def is_turn_detection_area(self):
+        return self.estimate_path_curvature(self.vehpos_initial_index) >= self.turn_detect_curvature_threshold
+
+    def is_in_forward_detection_area(self, other_vehicle, max_distance, straight_half_width):
+        x_rel = other_vehicle["x_rel"]
+        y_rel = other_vehicle["y_rel"]
+        distance = other_vehicle["distance"]
+
+        if x_rel <= 0.0 or distance > max_distance:
+            return False
+
+        if self.is_turn_detection_area():
+            relative_angle = abs(math.atan2(y_rel, max(x_rel, 1e-6)))
+            return relative_angle <= self.turn_detect_half_angle
+
+        return abs(y_rel) <= straight_half_width and x_rel <= max_distance
+
     def classify_neighbor_vehicle(self, other_vehicle):
         x_rel = other_vehicle["x_rel"]
         y_rel = other_vehicle["y_rel"]
@@ -335,25 +363,29 @@ class Control:
         distance = other_vehicle["distance"]
 
         if (
-            x_rel > 0.0
-            and abs(y_rel) < self.lane_width / 2.0
+            self.is_in_forward_detection_area(
+                other_vehicle,
+                self.front_detect_dist,
+                self.straight_detect_half_width,
+            )
             and heading_diff < math.radians(45.0)
-            and x_rel < self.front_detect_dist
         ):
             return "FRONT_SAME_DIRECTION"
 
         if (
-            x_rel > 0.0
-            and abs(y_rel) < self.conflict_width
+            self.is_in_forward_detection_area(
+                other_vehicle,
+                self.oncoming_detect_dist,
+                self.conflict_width,
+            )
             and heading_diff > math.radians(120.0)
-            and distance < self.oncoming_detect_dist
         ):
             return "ONCOMING_VEHICLE"
 
         if abs(x_rel) < self.lane_width and abs(y_rel) < self.lane_width * 1.5:
             return "SIDE_VEHICLE"
 
-        if x_rel < 0.0 and abs(y_rel) < self.lane_width / 2.0 and distance < self.front_detect_dist:
+        if x_rel < 0.0 and abs(y_rel) < self.straight_detect_half_width and distance < self.rear_detect_dist:
             return "REAR_VEHICLE"
 
         return "IRRELEVANT"
@@ -450,7 +482,6 @@ class Control:
             if route_distance < self.lane_width / 2.0:
                 self.behavior_state = "NORMAL_PATH_FOLLOW"
 
-        self.stop_start_time = None
         self.front_block_start_time = None
         if self.behavior_state not in ("RETURN_TO_ROUTE", "NORMAL_PATH_FOLLOW"):
             self.behavior_state = "NORMAL_PATH_FOLLOW"
@@ -520,39 +551,21 @@ class Control:
 
         if ttc >= self.oncoming_ttc_threshold or distance >= self.oncoming_detect_dist:
             self.behavior_state = "NORMAL_PATH_FOLLOW"
-            self.stop_start_time = None
             self.last_selected_action = "oncoming_clear"
             return v_ref, w_ref
 
-        now = self.get_time_now()
-        stopped_long_enough = False
-        current_v = self.last_v_cmd if self.last_v_cmd > 1e-3 else v_ref
+        if self.behavior_state == "ONCOMING_YIELD" and self.last_v_cmd <= 1e-3:
+            current_v = 0.0
+        else:
+            current_v = self.last_v_cmd if self.last_v_cmd > 1e-3 else v_ref
         dt = 1.0 / self.control_rate if self.control_rate > 0 else 0.1
         v_cmd = max(0.0, current_v - self.comfort_decel * dt)
         speed_ratio = 0.0 if abs(v_ref) < 1e-6 else self.clamp(v_cmd / max(abs(v_ref), 1e-6), 0.0, 1.0)
         w_cmd = w_ref * speed_ratio
 
         if v_cmd <= 0.1:
-            if self.stop_start_time is None:
-                self.stop_start_time = now
-            stopped_long_enough = (now - self.stop_start_time) >= self.stop_wait_time
-        else:
-            self.stop_start_time = None
-
-        if stopped_long_enough:
-            self.behavior_state = "TRY_BYPASS"
-            candidate_paths = [
-                {"name": "bypass_left", "path": self.generate_offset_path(self.lane_change_offset, self.bypass_length)},
-                {"name": "bypass_right", "path": self.generate_offset_path(-self.lane_change_offset, self.bypass_length)},
-            ]
-            selected_path = self.select_safe_candidate_path(candidate_paths)
-            if selected_path:
-                self.current_bypass_path = selected_path
-                self.current_bypass_index = 0
-                self.last_selected_action = "bypass_oncoming"
-                return self.execute_current_bypass_path(v_ref, self.get_neighbor_vehicles()) or (0.0, 0.0)
-            self.last_selected_action = "yield_no_safe_bypass"
-            return 0.0, 0.0
+            v_cmd = 0.0
+            w_cmd = 0.0
 
         self.behavior_state = "ONCOMING_YIELD"
         self.last_selected_action = "yield_oncoming"
@@ -1033,7 +1046,21 @@ class Control:
         lookahead = lookahead / (1.0 + self.curvature_lookahead_gain * curvature)
         return self.clamp(lookahead, self.min_lookahead, self.max_lookahead)
 
+    def calc_turn_strength(self, signed_curvature):
+        abs_curvature = abs(signed_curvature)
+        curvature_range = self.turn_feedforward_full_curvature - self.turn_feedforward_start_curvature
+        if curvature_range <= 1e-6:
+            return 1.0 if abs_curvature >= self.turn_feedforward_full_curvature else 0.0
+        return self.clamp(
+            (abs_curvature - self.turn_feedforward_start_curvature) / curvature_range,
+            0.0,
+            1.0,
+        )
+
     def estimate_path_curvature(self, index, step=5):
+        return abs(self.estimate_signed_path_curvature(index, step))
+
+    def estimate_signed_path_curvature(self, index, step=5):
         point_count = self.get_effective_path_point_count()
         if point_count < 3:
             return 0.0
@@ -1071,7 +1098,7 @@ class Control:
         yaw_2 = math.atan2(y2 - y1, x2 - x1)
         yaw_delta = self.normalize_angle(yaw_2 - yaw_1)
         average_length = 0.5 * (segment_1 + segment_2)
-        return abs(yaw_delta) / max(average_length, 1e-6)
+        return yaw_delta / max(average_length, 1e-6)
 
     def limit_steering_angle(self, steering_angle):
         steering_angle = self.clamp(steering_angle, -self.max_steer, self.max_steer)
