@@ -13,7 +13,7 @@ class Control:
         self.udp_send_port = 9001
         self.server_ip = '192.168.1.100'
 
-        net = "RST6phjHTlYisx4dqWmCnNpkYfTV,127.0.0.1,4986,4987"
+        net = "RST6phjHTlYisx4dqWmCnNpkYfTV,127.0.0.1,9280,9281"
         if net != "":
             net = net.split(",")
             self.vehicle_name = net[0]
@@ -40,18 +40,18 @@ class Control:
         self.is_closed_path = False
         self.control_rate = 15  # hz
         self.wheel_base = 2.7
-        self.cruise_speed = 15.0
+        self.cruise_speed = 18.0
         self.min_lookahead = 5.0
-        self.max_lookahead = 22.0
-        self.base_lookahead = 5.5
-        self.speed_lookahead_gain = 0.6
-        self.curvature_lookahead_gain = 16.0
+        self.max_lookahead = 26.0
+        self.base_lookahead = 6.0
+        self.speed_lookahead_gain = 0.65
+        self.curvature_lookahead_gain = 14.0
         self.lookahead_distance = self.min_lookahead
         self.max_steer = math.radians(30.0)
         self.max_steer_rate = math.radians(180.0)
         self.last_steering_angle = 0.0
         self.min_speed = 4.0
-        self.max_lat_acc = 3.0
+        self.max_lat_acc = 3.6
         self.turn_feedforward_gain = 0.5
         self.turn_feedforward_start_curvature = 0.025
         self.turn_feedforward_full_curvature = 0.12
@@ -100,6 +100,9 @@ class Control:
         self.prediction_dt = 0.3
         self.emergency_ttc = 1.0
         self.emergency_distance = 3.0
+        self.route_conflict_horizon = 3.5
+        self.route_conflict_radius = 3.0
+        self.junction_yield_decel = 3.0
 
         # Boundary JSONs in this project use the same x-right/y-up map
         # coordinate convention as the route JSONs. If a future boundary file
@@ -120,7 +123,7 @@ class Control:
 
     def control_node(self):
         start_time = time.time()
-        self.load_route('exp_routes/ccw_right_bottom_loop_adjusted.json')
+        self.load_route('exp_routes/path_points_better.json')
         self.try_load_default_map_boundaries()
         while True:
             self.run_step()
@@ -536,6 +539,12 @@ class Control:
                 self.print_behavior_debug(v_cmd, w_cmd)
                 return v_cmd, w_cmd
 
+        route_conflict = self.find_predicted_route_conflict(neighbor_vehicles, v_ref)
+        if route_conflict is not None:
+            v_cmd, w_cmd = self.handle_route_conflict(route_conflict, v_ref, w_ref)
+            self.print_behavior_debug(v_cmd, w_cmd)
+            return v_cmd, w_cmd
+
         risky_oncoming = self.find_nearest_risky_vehicle(neighbor_vehicles, "ONCOMING_VEHICLE")
         if risky_oncoming is not None:
             v_cmd, w_cmd = self.handle_oncoming_vehicle(risky_oncoming, v_ref, w_ref)
@@ -597,26 +606,7 @@ class Control:
         v_cmd = self.clamp(v_cmd, 0.0, max(0.0, v_ref))
         w_cmd = w_ref
         self.last_selected_action = "front_follow"
-
-        now = self.get_time_now()
-        if front_speed < self.low_speed_threshold and gap < safe_gap + self.lane_width:
-            if self.front_block_start_time is None:
-                self.front_block_start_time = now
-            blocking_time = now - self.front_block_start_time
-        else:
-            self.front_block_start_time = None
-            blocking_time = 0.0
-
-        if blocking_time >= self.blocking_time_threshold:
-            candidate_paths = self.generate_lane_change_candidates()
-            selected_path = self.select_safe_candidate_path(candidate_paths)
-            if selected_path:
-                self.current_bypass_path = selected_path
-                self.current_bypass_index = 0
-                self.behavior_state = "TRY_LANE_CHANGE"
-                self.last_selected_action = "lane_change"
-                return self.execute_current_bypass_path(v_ref, self.get_neighbor_vehicles()) or (v_cmd, w_cmd)
-            self.last_selected_action = "follow_no_safe_lane_change"
+        self.front_block_start_time = None
 
         return v_cmd, w_cmd
 
@@ -647,6 +637,115 @@ class Control:
 
         self.behavior_state = "ONCOMING_YIELD"
         self.last_selected_action = "yield_oncoming"
+        return v_cmd, w_cmd
+
+    def predict_reference_path_with_times(self, speed, horizon):
+        path_points = [(0.0, self.m_x, self.m_y, 0.0)]
+        point_count = self.get_effective_path_point_count()
+        if point_count < 2 or horizon <= 0.0:
+            return path_points
+
+        speed = max(abs(speed), 1.0)
+        start_index = self.normalize_path_index(self.vehpos_initial_index)
+        max_steps = point_count if self.is_closed_path else max(0, point_count - start_index - 1)
+        elapsed = 0.0
+        distance_along_route = 0.0
+        previous_x = self.m_x
+        previous_y = self.m_y
+
+        for step in range(1, max_steps + 1):
+            if self.is_closed_path:
+                point_index = self.normalize_path_index(start_index + step)
+            else:
+                point_index = min(start_index + step, point_count - 1)
+
+            point_x = self.X_points[point_index]
+            point_y = self.Y_points[point_index]
+            segment_length = math.hypot(point_x - previous_x, point_y - previous_y)
+            if segment_length <= 1e-6:
+                previous_x = point_x
+                previous_y = point_y
+                continue
+
+            segment_time = segment_length / speed
+            next_elapsed = elapsed + segment_time
+            if next_elapsed > horizon:
+                remaining_time = max(0.0, horizon - elapsed)
+                ratio = self.clamp(remaining_time / segment_time, 0.0, 1.0)
+                point_x = previous_x + (point_x - previous_x) * ratio
+                point_y = previous_y + (point_y - previous_y) * ratio
+                distance_along_route += segment_length * ratio
+                path_points.append((horizon, point_x, point_y, distance_along_route))
+                break
+
+            elapsed = next_elapsed
+            distance_along_route += segment_length
+            path_points.append((elapsed, point_x, point_y, distance_along_route))
+            previous_x = point_x
+            previous_y = point_y
+
+            if elapsed >= horizon or (not self.is_closed_path and point_index == point_count - 1):
+                break
+
+        return path_points
+
+    def find_predicted_route_conflict(self, neighbor_vehicles, v_ref):
+        route_path = self.predict_reference_path_with_times(v_ref, self.route_conflict_horizon)
+        if len(route_path) < 2:
+            return None
+
+        best_conflict = None
+        for vehicle in neighbor_vehicles:
+            if vehicle.get("classification") in ("REAR_VEHICLE", "FRONT_SAME_DIRECTION"):
+                continue
+
+            for elapsed, route_x, route_y, route_distance in route_path[1:]:
+                predicted_x, predicted_y = self.predict_vehicle_position(vehicle, elapsed)
+                distance = math.hypot(route_x - predicted_x, route_y - predicted_y)
+                if distance >= self.route_conflict_radius:
+                    continue
+
+                conflict = {
+                    "vehicle": vehicle,
+                    "time": elapsed,
+                    "distance": distance,
+                    "route_distance": route_distance,
+                    "route_point": (route_x, route_y),
+                    "vehicle_point": (predicted_x, predicted_y),
+                }
+                if best_conflict is None or elapsed < best_conflict["time"]:
+                    best_conflict = conflict
+                break
+
+        return best_conflict
+
+    def handle_route_conflict(self, route_conflict, v_ref, w_ref):
+        conflict_time = route_conflict.get("time", float("inf"))
+        conflict_route_distance = route_conflict.get("route_distance", float("inf"))
+        self.last_ttc = conflict_time
+        self.last_front_gap = conflict_route_distance
+
+        if conflict_time <= self.emergency_ttc or conflict_route_distance <= self.emergency_distance:
+            self.behavior_state = "EMERGENCY_STOP"
+            self.last_selected_action = "junction_conflict_stop"
+            return 0.0, 0.0
+
+        if self.behavior_state == "JUNCTION_YIELD" and self.last_v_cmd <= 1e-3:
+            current_v = 0.0
+        else:
+            current_v = self.last_v_cmd if self.last_v_cmd > 1e-3 else v_ref
+
+        dt = 1.0 / self.control_rate if self.control_rate > 0 else 0.1
+        v_cmd = max(0.0, current_v - self.junction_yield_decel * dt)
+        speed_ratio = 0.0 if abs(v_ref) < 1e-6 else self.clamp(v_cmd / max(abs(v_ref), 1e-6), 0.0, 1.0)
+        w_cmd = w_ref * speed_ratio
+
+        if v_cmd <= 0.1:
+            v_cmd = 0.0
+            w_cmd = 0.0
+
+        self.behavior_state = "JUNCTION_YIELD"
+        self.last_selected_action = "junction_yield"
         return v_cmd, w_cmd
 
     def generate_lane_change_candidates(self):
